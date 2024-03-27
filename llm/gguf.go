@@ -5,9 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log/slog"
-	"os"
-	"regexp"
 	"strings"
 
 	"github.com/jmorganca/ollama/format"

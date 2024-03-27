@@ -182,7 +182,7 @@ func (t Tensor) size() uint64 {
 
 type container interface {
 	Name() string
-	Decode(*readSeekOffset) (model, error)
+	Decode(io.ReadSeeker) (model, error)
 }
 
 const (

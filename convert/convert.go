@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/d4l3k/go-bfloat16"
 	"github.com/mitchellh/mapstructure"
@@ -132,6 +133,7 @@ func ReadSafeTensors(fn string, offset uint64, params *Params) ([]llm.Tensor, ui
 
 		t.WriterTo = safetensorWriterTo{
 			t:           &t,
+			params:      params,
 			bo:          params.ByteOrder,
 			headCount:   uint32(params.AttentionHeads),
 			headCountKV: uint32(params.KeyValHeads),
@@ -325,6 +327,7 @@ func GetTensorName(n string) (string, error) {
 type safetensorWriterTo struct {
 	t *llm.Tensor
 
+	params      *Params
 	bo          ByteOrder
 	headCount   uint32
 	headCountKV uint32
@@ -332,6 +335,29 @@ type safetensorWriterTo struct {
 	filename string
 
 	start, end, padding uint64
+}
+
+func (r safetensorWriterTo) addOnes(data []float32) ([]float32, error) {
+	n := tensor.New(tensor.WithShape(int(r.t.Shape[0])), tensor.WithBacking(data))
+	ones := tensor.Ones(tensor.Float32, int(r.t.Shape[0]))
+
+	var err error
+	n, err = n.Add(ones)
+	if err != nil {
+		return []float32{}, err
+	}
+
+	newN, err := native.SelectF32(n, 0)
+	if err != nil {
+		return []float32{}, err
+	}
+
+	var fullTensor []float32
+	for _, v := range newN {
+		fullTensor = append(fullTensor, v...)
+	}
+
+	return fullTensor, nil
 }
 
 func (r safetensorWriterTo) repack(data []uint16, heads int) ([]uint16, error) {
@@ -367,6 +393,11 @@ func (r safetensorWriterTo) repack(data []uint16, heads int) ([]uint16, error) {
 }
 
 func (r safetensorWriterTo) WriteTo(w io.Writer) (n int64, err error) {
+	arch, err := getArchFromParams(r.params)
+	if err != nil {
+		return 0, err
+	}
+
 	f, err := os.Open(r.filename)
 	if err != nil {
 		return 0, err
@@ -377,100 +408,126 @@ func (r safetensorWriterTo) WriteTo(w io.Writer) (n int64, err error) {
 		return 0, err
 	}
 
-	pattern := `^blk\.[0-9]+\.attn_(?P<layer>q|k)\.weight$`
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return 0, err
-	}
-
-	matches := re.FindAllStringSubmatch(r.t.Name, -1)
-	if len(matches) > 0 {
-		layerSize := r.end - r.start
-
-		var err error
-		tData := make([]uint16, layerSize/2)
-		if err = binary.Read(f, r.bo, tData); err != nil {
-			return 0, err
-		}
-
-		layerType := matches[0][re.SubexpIndex("layer")]
-		var heads uint32
-		switch layerType {
-		case "q":
-			heads = r.headCount
-		case "k":
-			heads = r.headCountKV
-			if heads == 0 {
-				heads = r.headCount
-			}
-		}
-
-		tData, err = r.repack(tData, int(heads))
+	switch arch {
+	case "llama":
+		pattern := `^blk\.[0-9]+\.attn_(?P<layer>q|k)\.weight$`
+		re, err := regexp.Compile(pattern)
 		if err != nil {
 			return 0, err
 		}
 
-		var buf []byte
-		for _, n := range tData {
-			buf = r.bo.AppendUint16(buf, n)
-		}
+		matches := re.FindAllStringSubmatch(r.t.Name, -1)
+		if len(matches) > 0 {
+			layerSize := r.end - r.start
 
-		tempBuf := make([]uint16, len(tData))
-		tDataF32 := bfloat16.DecodeFloat32(buf)
-		for cnt, v := range tDataF32 {
-			tDataF16 := float16.Fromfloat32(v)
-			tempBuf[cnt] = uint16(tDataF16)
-		}
-
-		if err = binary.Write(w, r.bo, tempBuf); err != nil {
-			return 0, err
-		}
-	} else {
-		remaining := r.end - r.start
-
-		bufSize := uint64(10240)
-		var finished bool
-		for {
-			data := make([]byte, min(bufSize, remaining))
-
-			b, err := io.ReadFull(f, data)
-			remaining -= uint64(b)
-
-			if err == io.EOF || remaining <= 0 {
-				finished = true
-			} else if err != nil {
+			var err error
+			tData := make([]uint16, layerSize/2)
+			if err = binary.Read(f, r.bo, tData); err != nil {
 				return 0, err
 			}
 
-			// convert bfloat16 -> ieee float32
+			layerType := matches[0][re.SubexpIndex("layer")]
+			var heads uint32
+			switch layerType {
+			case "q":
+				heads = r.headCount
+			case "k":
+				heads = r.headCountKV
+				if heads == 0 {
+					heads = r.headCount
+				}
+			}
+
+			tData, err = r.repack(tData, int(heads))
+			if err != nil {
+				return 0, err
+			}
+
+			var buf []byte
+			for _, n := range tData {
+				buf = r.bo.AppendUint16(buf, n)
+			}
+
+			tempBuf := make([]uint16, len(tData))
+			tDataF32 := bfloat16.DecodeFloat32(buf)
+			for cnt, v := range tDataF32 {
+				tDataF16 := float16.Fromfloat32(v)
+				tempBuf[cnt] = uint16(tDataF16)
+			}
+
+			if err = binary.Write(w, r.bo, tempBuf); err != nil {
+				return 0, err
+			}
+			return 0, nil
+		}
+	case "gemma":
+		if strings.HasSuffix(r.t.Name, "norm.weight") {
+			slog.Debug(fmt.Sprintf("converting '%s'", r.t.Name))
+
+			data := make([]byte, r.end-r.start)
+			if err = binary.Read(f, r.bo, data); err != nil {
+				return 0, err
+			}
+
 			tDataF32 := bfloat16.DecodeFloat32(data)
 
-			switch r.t.Kind {
-			case 0:
-				if err := binary.Write(w, r.bo, tDataF32); err != nil {
-					return 0, err
-				}
-			case 1:
-				// convert float32 -> float16
-				tempBuf := make([]uint16, len(data)/2)
-				for cnt, v := range tDataF32 {
-					tDataF16 := float16.Fromfloat32(v)
-					tempBuf[cnt] = uint16(tDataF16)
-				}
-				if err := binary.Write(w, binary.LittleEndian, tempBuf); err != nil {
-					return 0, err
-				}
+			var err error
+			tDataF32, err = r.addOnes(tDataF32)
+			if err != nil {
+				return 0, err
 			}
-			if finished {
-				break
+
+			if err := binary.Write(w, r.bo, tDataF32); err != nil {
+				return 0, err
 			}
+			return 0, nil
+		}
+	}
+
+	remaining := r.end - r.start
+
+	bufSize := uint64(10240)
+	var finished bool
+	for {
+		data := make([]byte, min(bufSize, remaining))
+
+		b, err := io.ReadFull(f, data)
+		remaining -= uint64(b)
+
+		if err == io.EOF || remaining <= 0 {
+			finished = true
+		} else if err != nil {
+			return 0, err
+		}
+
+		// convert bfloat16 -> ieee float32
+		tDataF32 := bfloat16.DecodeFloat32(data)
+
+		switch r.t.Kind {
+		case 0:
+			if err := binary.Write(w, r.bo, tDataF32); err != nil {
+				return 0, err
+			}
+		case 1:
+			// convert float32 -> float16
+			tempBuf := make([]uint16, len(data)/2)
+			for cnt, v := range tDataF32 {
+				tDataF16 := float16.Fromfloat32(v)
+				tempBuf[cnt] = uint16(tDataF16)
+			}
+			if err := binary.Write(w, binary.LittleEndian, tempBuf); err != nil {
+				return 0, err
+			}
+		}
+		if finished {
+			break
 		}
 	}
 
 	return 0, nil
 }
 
-func WriteGGUF(name string, tensors []llm.Tensor, params *Params, vocab *Vocab) (string, error) {
+func getArchFromParams(params *Params) (string, error) {
 	var arch string
 	switch len(params.Architectures) {
 	case 0:
@@ -488,51 +545,64 @@ func WriteGGUF(name string, tensors []llm.Tensor, params *Params, vocab *Vocab) 
 		return "", fmt.Errorf("Multimodal models are not yet supported")
 	}
 
-	m := llm.NewGGUFModel(&c)
-	m.Tensors = tensors
+	return arch, nil
+}
 
-	m.KV["general.architecture"] = arch
-	m.KV["general.name"] = name
+func WriteGGUF(name string, tensors []llm.Tensor, params *Params, vocab *Vocab) (string, error) {
+	arch, err := getArchFromParams(params)
+	if err != nil {
+		return "", err
+	}
+
+	kv := llm.KV{
+		"general.architecture": arch,
+		"general.name":         name,
+	}
 
 	switch arch {
 	case "llama":
-		m.KV["llama.context_length"] = uint32(params.ContextSize)
-		m.KV["llama.embedding_length"] = uint32(params.HiddenSize)
-		m.KV["llama.block_count"] = uint32(params.HiddenLayers)
-		m.KV["llama.feed_forward_length"] = uint32(params.IntermediateSize)
-		m.KV["llama.rope.dimension_count"] = uint32(params.HiddenSize / params.AttentionHeads)
-		slog.Debug(fmt.Sprintf("rope dim count = %d", m.KV["llama.rope.dimension_count"]))
-		m.KV["llama.attention.head_count"] = uint32(params.AttentionHeads)
-		m.KV["llama.attention.head_count_kv"] = uint32(params.KeyValHeads)
-		m.KV["llama.attention.layer_norm_rms_epsilon"] = float32(params.NormEPS)
-		m.KV["llama.rope.freq_base"] = float32(params.RopeFreqBase)
+		kv["llama.context_length"] = uint32(params.ContextSize)
+		kv["llama.embedding_length"] = uint32(params.HiddenSize)
+		kv["llama.block_count"] = uint32(params.HiddenLayers)
+		kv["llama.feed_forward_length"] = uint32(params.IntermediateSize)
+		kv["llama.rope.dimension_count"] = uint32(params.HiddenSize / params.AttentionHeads)
+		slog.Debug(fmt.Sprintf("rope dim count = %d", kv["llama.rope.dimension_count"]))
+		kv["llama.attention.head_count"] = uint32(params.AttentionHeads)
+		kv["llama.attention.head_count_kv"] = uint32(params.KeyValHeads)
+		kv["llama.attention.layer_norm_rms_epsilon"] = float32(params.NormEPS)
+		kv["llama.rope.freq_base"] = float32(params.RopeFreqBase)
 	case "gemma":
-		m.KV["gemma.context_length"] = uint32(params.ContextSize)
-		m.KV["gemma.embedding_length"] = uint32(params.HiddenSize)
-		m.KV["gemma.block_count"] = uint32(params.HiddenLayers)
-		m.KV["gemma.feed_forward_length"] = uint32(params.IntermediateSize)
-		m.KV["gemma.attention.head_count"] = uint32(params.AttentionHeads)
-		m.KV["gemma.attention.head_count_kv"] = uint32(params.KeyValHeads)
-		m.KV["gemma.attention.layer_norm_rms_epsilon"] = float32(params.NormEPS)
-		m.KV["gemma.attention.key_length"] = uint32(params.HeadDimension)
-		m.KV["gemma.attention.value_length"] = uint32(params.HeadDimension)
+		kv["gemma.context_length"] = uint32(params.ContextSize)
+		kv["gemma.embedding_length"] = uint32(params.HiddenSize)
+		kv["gemma.block_count"] = uint32(params.HiddenLayers)
+		kv["gemma.feed_forward_length"] = uint32(params.IntermediateSize)
+		kv["gemma.attention.head_count"] = uint32(params.AttentionHeads)
+		kv["gemma.attention.head_count_kv"] = uint32(params.KeyValHeads)
+		kv["gemma.attention.layer_norm_rms_epsilon"] = float32(params.NormEPS)
+		kv["gemma.attention.key_length"] = uint32(params.HeadDimension)
+		kv["gemma.attention.value_length"] = uint32(params.HeadDimension)
 	}
 
-	m.KV["general.file_type"] = uint32(1)
-	m.KV["tokenizer.ggml.model"] = "llama"
-	m.KV["tokenizer.ggml.bos_token_id"] = uint32(params.BoSTokenID)
-	m.KV["tokenizer.ggml.eos_token_id"] = uint32(params.EoSTokenID)
+	kv["general.file_type"] = uint32(1)
+	kv["tokenizer.ggml.model"] = "llama"
+
+	kv["tokenizer.ggml.tokens"] = vocab.Tokens
+	kv["tokenizer.ggml.scores"] = vocab.Scores
+	kv["tokenizer.ggml.token_type"] = vocab.Types
+
+	kv["tokenizer.ggml.bos_token_id"] = uint32(params.BoSTokenID)
+	kv["tokenizer.ggml.eos_token_id"] = uint32(params.EoSTokenID)
 
 	switch arch {
 	case "llama":
-		m.KV["tokenizer.ggml.unknown_token_id"] = uint32(0)
+		kv["tokenizer.ggml.unknown_token_id"] = uint32(0)
 	case "gemma":
-		m.KV["tokenizer.ggml.padding_token_id"] = uint32(params.PaddingTokenID)
-		m.KV["tokenizer.ggml.unknown_token_id"] = uint32(3)
+		kv["tokenizer.ggml.padding_token_id"] = uint32(params.PaddingTokenID)
+		kv["tokenizer.ggml.unknown_token_id"] = uint32(3)
 	}
 
-	m.KV["tokenizer.ggml.add_bos_token"] = true
-	m.KV["tokenizer.ggml.add_eos_token"] = false
+	kv["tokenizer.ggml.add_bos_token"] = true
+	kv["tokenizer.ggml.add_eos_token"] = false
 
 	f, err := os.CreateTemp("", "ollama-gguf")
 	if err != nil {
