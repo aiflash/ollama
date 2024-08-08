@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -54,7 +55,10 @@ func init() {
 	gin.SetMode(mode)
 }
 
-var errRequired = errors.New("is required")
+var (
+	errRequired    = errors.New("is required")
+	errBadTemplate = errors.New("template error")
+)
 
 func modelOptions(model *Model, requestOpts map[string]interface{}) (api.Options, error) {
 	opts := api.DefaultOptions()
@@ -121,6 +125,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	}
 
 	caps := []Capability{CapabilityCompletion}
+	if req.Suffix != "" {
+		caps = append(caps, CapabilityInsert)
+	}
+
 	r, m, opts, err := s.scheduleRunner(c.Request.Context(), req.Model, caps, req.Options, req.KeepAlive)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support generate", req.Model)})
@@ -149,19 +157,6 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	prompt := req.Prompt
 	if !req.Raw {
-		var msgs []api.Message
-		if req.System != "" {
-			msgs = append(msgs, api.Message{Role: "system", Content: req.System})
-		} else if m.System != "" {
-			msgs = append(msgs, api.Message{Role: "system", Content: m.System})
-		}
-
-		for _, i := range images {
-			msgs = append(msgs, api.Message{Role: "user", Content: fmt.Sprintf("[img-%d]", i.ID)})
-		}
-
-		msgs = append(msgs, api.Message{Role: "user", Content: req.Prompt})
-
 		tmpl := m.Template
 		if req.Template != "" {
 			tmpl, err = template.Parse(req.Template)
@@ -171,6 +166,29 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			}
 		}
 
+		var values template.Values
+		if req.Suffix != "" {
+			values.Prompt = prompt
+			values.Suffix = req.Suffix
+		} else {
+			var msgs []api.Message
+			if req.System != "" {
+				msgs = append(msgs, api.Message{Role: "system", Content: req.System})
+			} else if m.System != "" {
+				msgs = append(msgs, api.Message{Role: "system", Content: m.System})
+			}
+
+			if req.Context == nil {
+				msgs = append(msgs, m.Messages...)
+			}
+
+			for _, i := range images {
+				msgs = append(msgs, api.Message{Role: "user", Content: fmt.Sprintf("[img-%d]", i.ID)})
+			}
+
+			values.Messages = append(msgs, api.Message{Role: "user", Content: req.Prompt})
+		}
+
 		var b bytes.Buffer
 		if req.Context != nil {
 			s, err := r.Detokenize(c.Request.Context(), req.Context)
@@ -178,11 +196,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
-
 			b.WriteString(s)
 		}
 
-		if err := tmpl.Execute(&b, template.Values{Messages: msgs}); err != nil {
+		if err := tmpl.Execute(&b, values); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -231,7 +248,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 						ch <- gin.H{"error": err.Error()}
 						return
 					}
-					res.Context = append(req.Context, tokens...)
+					res.Context = tokens
 				}
 			}
 
@@ -271,6 +288,126 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	streamResponse(c, ch)
 }
 
+func (s *Server) EmbedHandler(c *gin.Context) {
+	checkpointStart := time.Now()
+	var req api.EmbedRequest
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	truncate := true
+
+	if req.Truncate != nil && !*req.Truncate {
+		truncate = false
+	}
+
+	var input []string
+
+	switch i := req.Input.(type) {
+	case string:
+		if len(i) > 0 {
+			input = append(input, i)
+		}
+	case []any:
+		for _, v := range i {
+			if _, ok := v.(string); !ok {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid input type"})
+				return
+			}
+			input = append(input, v.(string))
+		}
+	default:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid input type"})
+		return
+	}
+
+	if len(input) == 0 {
+		c.JSON(http.StatusOK, api.EmbedResponse{Model: req.Model, Embeddings: [][]float32{}})
+		return
+	}
+
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), req.Model, []Capability{}, req.Options, req.KeepAlive)
+	if err != nil {
+		handleScheduleError(c, req.Model, err)
+		return
+	}
+
+	checkpointLoaded := time.Now()
+
+	kvData, err := getKVData(m.ModelPath, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	for i, s := range input {
+		tokens, err := r.Tokenize(c.Request.Context(), s)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		ctxLen := min(opts.NumCtx, int(kvData.ContextLength()))
+		if len(tokens) > ctxLen {
+			if !truncate {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "input length exceeds maximum context length"})
+				return
+			}
+
+			tokens = tokens[:ctxLen]
+			s, err = r.Detokenize(c.Request.Context(), tokens)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+		}
+
+		input[i] = s
+	}
+	embeddings, err := r.Embed(c.Request.Context(), input)
+	if err != nil {
+		slog.Error("embedding generation failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate embedding"})
+		return
+	}
+
+	for i, e := range embeddings.Embedding {
+		embeddings.Embedding[i] = normalize(e)
+	}
+
+	resp := api.EmbedResponse{
+		Model:           req.Model,
+		Embeddings:      embeddings.Embedding,
+		TotalDuration:   time.Since(checkpointStart),
+		LoadDuration:    checkpointLoaded.Sub(checkpointStart),
+		PromptEvalCount: embeddings.PromptEvalCount,
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func normalize(vec []float32) []float32 {
+	var sum float32
+	for _, v := range vec {
+		sum += v * v
+	}
+
+	norm := float32(0.0)
+	if sum > 0 {
+		norm = float32(1.0 / math.Sqrt(float64(sum)))
+	}
+
+	for i := range vec {
+		vec[i] *= norm
+	}
+	return vec
+}
+
 func (s *Server) EmbeddingsHandler(c *gin.Context) {
 	var req api.EmbeddingRequest
 	if err := c.ShouldBindJSON(&req); errors.Is(err, io.EOF) {
@@ -293,14 +430,23 @@ func (s *Server) EmbeddingsHandler(c *gin.Context) {
 		return
 	}
 
-	embedding, err := r.Embedding(c.Request.Context(), req.Prompt)
+	embeddings, err := r.Embed(c.Request.Context(), []string{req.Prompt})
 	if err != nil {
 		slog.Info(fmt.Sprintf("embedding generation failed: %v", err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate embedding"})
 		return
 	}
 
-	c.JSON(http.StatusOK, api.EmbeddingResponse{Embedding: embedding})
+	embedding := make([]float64, len(embeddings.Embedding[0]))
+
+	for i, v := range embeddings.Embedding[0] {
+		embedding[i] = float64(v)
+	}
+
+	resp := api.EmbeddingResponse{
+		Embedding: embedding,
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) PullModelHandler(c *gin.Context) {
@@ -410,7 +556,7 @@ func checkNameExists(name model.Name) error {
 
 	for n := range names {
 		if strings.EqualFold(n.Filepath(), name.Filepath()) && n != name {
-			return fmt.Errorf("a model with that name already exists")
+			return errors.New("a model with that name already exists")
 		}
 	}
 
@@ -472,7 +618,9 @@ func (s *Server) CreateModelHandler(c *gin.Context) {
 		defer cancel()
 
 		quantization := cmp.Or(r.Quantize, r.Quantization)
-		if err := CreateModel(ctx, name, filepath.Dir(r.Path), strings.ToUpper(quantization), f, fn); err != nil {
+		if err := CreateModel(ctx, name, filepath.Dir(r.Path), strings.ToUpper(quantization), f, fn); errors.Is(err, errBadTemplate) {
+			ch <- gin.H{"error": err.Error(), "status": http.StatusBadRequest}
+		} else if err != nil {
 			ch <- gin.H{"error": err.Error()}
 		}
 	}()
@@ -581,7 +729,7 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 
 	n := model.ParseName(req.Model)
 	if !n.IsValid() {
-		return nil, fmt.Errorf("invalid model name")
+		return nil, errors.New("invalid model name")
 	}
 
 	manifest, err := ParseNamedManifest(n)
@@ -676,17 +824,20 @@ func (s *Server) ListModelsHandler(c *gin.Context) {
 
 	models := []api.ListModelResponse{}
 	for n, m := range ms {
-		f, err := m.Config.Open()
-		if err != nil {
-			slog.Warn("bad manifest filepath", "name", n, "error", err)
-			continue
-		}
-		defer f.Close()
-
 		var cf ConfigV2
-		if err := json.NewDecoder(f).Decode(&cf); err != nil {
-			slog.Warn("bad manifest config", "name", n, "error", err)
-			continue
+
+		if m.Config.Digest != "" {
+			f, err := m.Config.Open()
+			if err != nil {
+				slog.Warn("bad manifest filepath", "name", n, "error", err)
+				continue
+			}
+			defer f.Close()
+
+			if err := json.NewDecoder(f).Decode(&cf); err != nil {
+				slog.Warn("bad manifest config", "name", n, "error", err)
+				continue
+			}
 		}
 
 		// tag should never be masked
@@ -845,7 +996,7 @@ func allowedHost(host string) bool {
 		return true
 	}
 
-	var tlds = []string{
+	tlds := []string{
 		"localhost",
 		"local",
 		"internal",
@@ -908,7 +1059,7 @@ func (s *Server) GenerateRoutes() http.Handler {
 	for _, prop := range openAIProperties {
 		config.AllowHeaders = append(config.AllowHeaders, "x-stainless-"+prop)
 	}
-	config.AllowOrigins = envconfig.AllowOrigins
+	config.AllowOrigins = envconfig.Origins()
 
 	r := gin.Default()
 	r.Use(
@@ -919,6 +1070,7 @@ func (s *Server) GenerateRoutes() http.Handler {
 	r.POST("/api/pull", s.PullModelHandler)
 	r.POST("/api/generate", s.GenerateHandler)
 	r.POST("/api/chat", s.ChatHandler)
+	r.POST("/api/embed", s.EmbedHandler)
 	r.POST("/api/embeddings", s.EmbeddingsHandler)
 	r.POST("/api/create", s.CreateModelHandler)
 	r.POST("/api/push", s.PushModelHandler)
@@ -932,6 +1084,7 @@ func (s *Server) GenerateRoutes() http.Handler {
 	// Compatibility endpoints
 	r.POST("/v1/chat/completions", openai.ChatMiddleware(), s.ChatHandler)
 	r.POST("/v1/completions", openai.CompletionsMiddleware(), s.GenerateHandler)
+	r.POST("/v1/embeddings", openai.EmbeddingsMiddleware(), s.EmbedHandler)
 	r.GET("/v1/models", openai.ListMiddleware(), s.ListModelsHandler)
 	r.GET("/v1/models/:model", openai.RetrieveMiddleware(), s.ShowModelHandler)
 
@@ -951,7 +1104,7 @@ func (s *Server) GenerateRoutes() http.Handler {
 
 func Serve(ln net.Listener) error {
 	level := slog.LevelInfo
-	if envconfig.Debug {
+	if envconfig.Debug() {
 		level = slog.LevelDebug
 	}
 
@@ -979,7 +1132,7 @@ func Serve(ln net.Listener) error {
 		return err
 	}
 
-	if !envconfig.NoPrune {
+	if !envconfig.NoPrune() {
 		// clean up unused layers and manifests
 		if err := PruneLayers(); err != nil {
 			return err
@@ -1058,11 +1211,15 @@ func waitForStream(c *gin.Context, ch chan interface{}) {
 				return
 			}
 		case gin.H:
+			status, ok := r["status"].(int)
+			if !ok {
+				status = http.StatusInternalServerError
+			}
 			if errorMsg, ok := r["error"].(string); ok {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": errorMsg})
+				c.JSON(status, gin.H{"error": errorMsg})
 				return
 			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error format in progress response"})
+				c.JSON(status, gin.H{"error": "unexpected error format in progress response"})
 				return
 			}
 		default:
@@ -1152,6 +1309,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}
 
 	caps := []Capability{CapabilityCompletion}
+	if len(req.Tools) > 0 {
+		caps = append(caps, CapabilityTools)
+	}
+
 	r, m, opts, err := s.scheduleRunner(c.Request.Context(), req.Model, caps, req.Options, req.KeepAlive)
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
@@ -1174,11 +1335,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
-	if req.Messages[0].Role != "system" {
-		req.Messages = append([]api.Message{{Role: "system", Content: m.System}}, req.Messages...)
+	msgs := append(m.Messages, req.Messages...)
+	if req.Messages[0].Role != "system" && m.System != "" {
+		msgs = append([]api.Message{{Role: "system", Content: m.System}}, msgs...)
 	}
 
-	prompt, images, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, req.Messages)
+	prompt, images, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, req.Tools)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1221,13 +1383,13 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}()
 
 	if req.Stream != nil && !*req.Stream {
-		var r api.ChatResponse
+		var resp api.ChatResponse
 		var sb strings.Builder
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
 				sb.WriteString(t.Message.Content)
-				r = t
+				resp = t
 			case gin.H:
 				msg, ok := t["error"].(string)
 				if !ok {
@@ -1242,8 +1404,16 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 		}
 
-		r.Message.Content = sb.String()
-		c.JSON(http.StatusOK, r)
+		resp.Message.Content = sb.String()
+
+		if len(req.Tools) > 0 {
+			if toolCalls, ok := m.parseToolCalls(sb.String()); ok {
+				resp.Message.ToolCalls = toolCalls
+				resp.Message.Content = ""
+			}
+		}
+
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 
@@ -1252,7 +1422,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 func handleScheduleError(c *gin.Context, name string, err error) {
 	switch {
-	case errors.Is(err, errRequired):
+	case errors.Is(err, errCapabilities), errors.Is(err, errRequired):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, context.Canceled):
 		c.JSON(499, gin.H{"error": "request canceled"})
