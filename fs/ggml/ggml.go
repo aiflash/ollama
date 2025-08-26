@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 
+	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/util/bufioutil"
 )
 
@@ -275,7 +277,7 @@ type Tensor struct {
 
 func (t Tensor) block() (n int) {
 	if _, err := fmt.Sscanf(t.Name, "blk.%d.", &n); err != nil {
-		return -1
+		return math.MaxInt
 	}
 
 	return
@@ -479,7 +481,7 @@ func Decode(rs io.ReadSeeker, maxArraySize int) (*GGML, error) {
 	}, nil
 }
 
-func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType string) (kv []uint64, partialOffload, fullOffload uint64) {
+func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType string, useFlashAttention bool) (kv []uint64, partialOffload, fullOffload uint64) {
 	context *= uint64(numParallel)
 
 	embedding := f.KV().EmbeddingLength()
@@ -677,7 +679,12 @@ func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType stri
 				kv[i] *= context
 			}
 		}
+
 		partialOffload = 2 * f.KV().HeadCountMax() / cmp.Or(f.KV().HeadCountKVMin(), 1) * kvTotal / 6
+		if useFlashAttention {
+			// rough estimate of graph size with flash attention on
+			partialOffload = (4*uint64(numParallel) + context>>10 + 110) * format.MebiByte
+		}
 	}
 
 	return
@@ -771,6 +778,13 @@ func (f GGML) SupportsFlashAttention() bool {
 	headCountK := f.KV().EmbeddingHeadCountK()
 	headCountV := f.KV().EmbeddingHeadCountV()
 	return headCountK != 0 && headCountV != 0 && headCountK == headCountV
+}
+
+// FlashAttention checks if the model should enable flash attention
+func (f GGML) FlashAttention() bool {
+	return slices.Contains([]string{
+		"gptoss", "gpt-oss",
+	}, f.KV().String("general.architecture"))
 }
 
 // kvCacheBytesPerElement returns the number of bytes per element for a given KV cache type
